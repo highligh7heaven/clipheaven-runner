@@ -1,0 +1,61 @@
+name: Weekly top 10
+
+# Every Sunday: joins the week's best clips (by the AI's score) into one
+# "Top 10 moments this week" countdown video, saves it to Google Drive →
+# ClipHeaven Clips → Weekly and puts it on the dashboard. Turn it off on the
+# dashboard: Profile → Weekly top 10. Can also be started by hand.
+on:
+  schedule:
+    - cron: "41 18 * * 0"  # Sundays, late morning in North America (GitHub may start it a little late)
+  workflow_dispatch:
+    inputs:
+      include_tests:
+        description: "Also use test clips (to try it out)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: weekly
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # adds the video to the dashboard's status.json
+
+jobs:
+  weekly:
+    name: Make the weekly top 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CLIPHEAVEN_RUNNER: github
+      PYTHONUNBUFFERED: "1"
+      WEEKLY_INCLUDE_TESTS: ${{ inputs.include_tests == 'true' && '1' || '' }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}  # optional: notifications in the ClipHeaven app
+      TIME_ZONE: ${{ vars.TIME_ZONE }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Get the ClipHeaven code
+        uses: actions/checkout@v4
+        with:
+          repository: highligh7heaven/clip-bot
+          ref: main
+          token: ${{ secrets.CODE_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core > /dev/null
+          pip install -q requests numpy pillow emoji google-api-python-client google-auth cryptography
+
+      - name: Make the video
+        run: python -m clipheaven.weekly

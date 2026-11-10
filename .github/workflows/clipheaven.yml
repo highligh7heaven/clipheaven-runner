@@ -1,0 +1,259 @@
+name: ClipHeaven
+
+# Makes new videos on GitHub's computers and saves them to Google Drive
+# (ClipHeaven Clips/<date> <time>). Start it from the GitHub app: Actions tab →
+# ClipHeaven → Run workflow. You don't need to keep anything open while it runs.
+#
+# Automatic 7am/6pm runs are switched off for now. To turn them on, see
+# "Turning on the 7am / 6pm schedule" in docs/github-actions-setup.md.
+#
+# Big runs are split to finish sooner: "Make clips" finds the moments and writes
+# the titles, up to 4 "Edit" computers make the videos at the same time (each
+# clip lands in Drive as soon as it's done), then "Finish" writes the post info.
+# Small runs and test runs do everything in "Make clips".
+on:
+  workflow_dispatch:
+    inputs:
+      videos:
+        description: "How many videos to make (blank = VIDEOS_TO_MAKE from your Settings sheet)"
+        required: false
+        default: ""
+      links:
+        description: "Stream links to chop into clips (Twitch/Kick; twitch.tv/name = latest stream). Blank = usual run"
+        required: false
+        default: ""
+      clips:
+        description: "How many clips in all, shared between the streamers (blank = per streamer, from your Settings sheet)"
+        required: false
+        default: ""
+      streamers:
+        description: "Twitch streamers for this run only, e.g. lacy, kaicenat (blank = your Settings sheet)"
+        required: false
+        default: ""
+      kick_streamers:
+        description: "Kick streamers for this run only, e.g. tjr (blank = your Settings sheet)"
+        required: false
+        default: ""
+      campaign:
+        description: "A campaign saved on the dashboard (its streamers, tags and clip length are used)"
+        required: false
+        default: ""
+      test:
+        description: "Test mode: make just 1 clip to check the look"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  # Test clips don't touch the used-clips memory, so they don't wait behind real runs.
+  group: ${{ inputs.test && 'clipheaven-test' || 'clipheaven' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # only to keep the dashboard's status.json up to date (dashboard-data branch)
+
+env:
+  CLIPHEAVEN_RUNNER: github
+  CLIPHEAVEN_DRIVE: /tmp/clipheaven/drive
+  CLIPHEAVEN_WORK: /tmp/clipheaven/work
+  PYTHONTZPATH: ""  # use the up-to-date tzdata package, not the machine's older copy
+  PYTHONUNBUFFERED: "1"  # show progress in the GitHub app as it happens, not all at the end
+  TIME_ZONE: ${{ vars.TIME_ZONE }}  # optional repository variable, e.g. Europe/London
+  # Videos per run: the number typed in the Run workflow box, else the
+  # VIDEOS_PER_RUN repository variable, else VIDEOS_TO_MAKE in the Settings sheet.
+  CLIPHEAVEN_VIDEOS: ${{ inputs.videos || vars.VIDEOS_PER_RUN }}
+  CLIPHEAVEN_CLIPS: ${{ inputs.clips }}
+  CLIPHEAVEN_TEST: ${{ inputs.test }}
+  CLIPHEAVEN_LINKS: ${{ inputs.links }}
+  # Streamers picked on the dashboard for this run only (blank = the Settings sheet's).
+  CLIPHEAVEN_STREAMERS: ${{ inputs.streamers }}
+  CLIPHEAVEN_KICK_STREAMERS: ${{ inputs.kick_streamers }}
+  CLIPHEAVEN_CAMPAIGN: ${{ inputs.campaign }}
+  GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+  GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+  GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+  TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+  TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+  SETTINGS_SHEET_URL: ${{ secrets.SETTINGS_SHEET_URL }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}  # optional: AI-written titles (free key)
+  CLIPHEAVEN_LICENSE: ${{ secrets.CLIPHEAVEN_LICENSE }}  # only used by sold copies
+  GITHUB_TOKEN: ${{ github.token }}  # updates the dashboard as clips are made
+  GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}  # optional: backup AI when Google's free limit runs out
+  NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}  # optional: phone notifications through the free ntfy app
+  VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}  # optional: notifications straight to the ClipHeaven app (docs/PUSH_SETUP.md)
+
+jobs:
+  clips:
+    name: Make clips
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      editors: ${{ steps.make.outputs.editors }}
+      count: ${{ steps.make.outputs.count }}
+      label: ${{ steps.make.outputs.label }}
+      date: ${{ steps.make.outputs.date }}
+    steps:
+      - name: Get the ClipHeaven code
+        uses: actions/checkout@v4
+        with:
+          repository: highligh7heaven/clip-bot
+          ref: main
+          token: ${{ secrets.CODE_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-actions.txt
+
+      - name: Check the time
+        id: slot
+        run: |
+          pip install -q -U tzdata
+          python -m clipheaven.schedule "${{ github.event_name }}" "${{ github.event.schedule }}"
+
+      - name: Install video tools
+        if: steps.slot.outputs.run == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg tesseract-ocr libpango-1.0-0 libpangoft2-1.0-0 \
+            fonts-dejavu-core fonts-liberation fonts-noto-color-emoji > /dev/null
+          pip install -q -r requirements-actions.txt
+
+      - name: Reuse the Whisper speech model
+        if: steps.slot.outputs.run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-base-en-v1
+
+      - name: Make the clips and save them to Google Drive
+        id: make
+        if: steps.slot.outputs.run == 'true'
+        run: python -m clipheaven.runner
+        env:
+          CLIPHEAVEN_PHASE: plan
+          CLIPHEAVEN_LABEL: ${{ steps.slot.outputs.label }}
+          CLIPHEAVEN_DATE: ${{ steps.slot.outputs.date }}
+
+      - name: Hand the plan to the editing computers
+        if: steps.make.outputs.editors != '' && steps.make.outputs.editors != '[]'
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: /tmp/clipheaven/drive
+          retention-days: 1
+
+      - name: Keep the test clip for 3 days (test mode only)
+        if: inputs.test && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-preview
+          path: /tmp/clipheaven/preview
+          retention-days: 3
+          if-no-files-found: ignore
+
+  edit:
+    name: Edit
+    needs: clips
+    if: needs.clips.outputs.editors != '' && needs.clips.outputs.editors != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(needs.clips.outputs.editors) }}
+    steps:
+      - name: Get the ClipHeaven code
+        uses: actions/checkout@v4
+        with:
+          repository: highligh7heaven/clip-bot
+          ref: main
+          token: ${{ secrets.CODE_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-actions.txt
+
+      - name: Install video tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg tesseract-ocr libpango-1.0-0 libpangoft2-1.0-0 \
+            fonts-dejavu-core fonts-liberation fonts-noto-color-emoji > /dev/null
+          pip install -q -r requirements-actions.txt
+
+      - name: Get the plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: /tmp/clipheaven/drive
+
+      - name: Edit this computer's videos and save them to Google Drive
+        run: python -m clipheaven.runner
+        env:
+          CLIPHEAVEN_PHASE: edit
+          CLIPHEAVEN_SHARD: ${{ matrix.part }}/${{ needs.clips.outputs.count }}
+          CLIPHEAVEN_LABEL: ${{ needs.clips.outputs.label }}
+          CLIPHEAVEN_DATE: ${{ needs.clips.outputs.date }}
+
+      - name: Hand the results to the finishing computer
+        uses: actions/upload-artifact@v4
+        with:
+          name: edit-${{ matrix.part }}
+          path: /tmp/clipheaven/drive/**/latest_edit-*.json
+          retention-days: 1
+
+  finish:
+    name: Finish
+    needs: [clips, edit]
+    if: always() && needs.clips.result == 'success' && needs.clips.outputs.editors != '' && needs.clips.outputs.editors != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Get the ClipHeaven code
+        uses: actions/checkout@v4
+        with:
+          repository: highligh7heaven/clip-bot
+          ref: main
+          token: ${{ secrets.CODE_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-actions.txt
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libpango-1.0-0 libpangoft2-1.0-0 fonts-dejavu-core fonts-liberation \
+            fonts-noto-color-emoji > /dev/null
+          pip install -q -r requirements-actions.txt
+
+      - name: Get the plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: /tmp/clipheaven/drive
+
+      - name: Get the editing results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: edit-*
+          path: /tmp/clipheaven/drive
+          merge-multiple: true
+
+      - name: Write the post info and finish up
+        run: python -m clipheaven.runner
+        env:
+          CLIPHEAVEN_PHASE: finish
+          CLIPHEAVEN_LABEL: ${{ needs.clips.outputs.label }}
+          CLIPHEAVEN_DATE: ${{ needs.clips.outputs.date }}

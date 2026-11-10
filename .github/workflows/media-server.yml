@@ -1,0 +1,73 @@
+name: Set up the Save button
+
+# Puts the ClipHeaven video server (media-server/worker.js) on your free
+# Cloudflare account, so the dashboard can play and save clips without
+# opening Google Drive. Run it once (and again after an update). Needs two
+# secrets: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID (see docs/SETUP.md).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # tells the dashboard where the video server is (dashboard-data branch)
+
+jobs:
+  deploy:
+    name: Set up the Save button
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      OWNER: ${{ github.repository_owner }}
+      GITHUB_TOKEN: ${{ github.token }}
+      WORKER: clipheaven-media
+    steps:
+      - name: Get the ClipHeaven code
+        uses: actions/checkout@v4
+        with:
+          repository: highligh7heaven/clip-bot
+          ref: main
+          token: ${{ secrets.CODE_TOKEN }}
+          persist-credentials: false
+
+      - name: Check the keys are there
+        run: |
+          missing=""
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET GOOGLE_REFRESH_TOKEN; do
+            [ -n "${!name}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Missing secrets::Add these GitHub secrets first:$missing (see docs/SETUP.md, 'The Save button')."
+            exit 1
+          fi
+
+      - name: Put the video server on Cloudflare
+        id: deploy
+        run: |
+          npx --yes wrangler@4.14.0 deploy media-server/worker.js --name "$WORKER" \
+            --compatibility-date 2025-05-01 2>&1 | tee deploy.log
+          url=$(grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev' deploy.log | head -1)
+          if [ -z "$url" ]; then
+            echo "::error title=No workers.dev address::Open Cloudflare → Workers & Pages once and pick a workers.dev subdomain, then run this again."
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Give it your Google keys
+        run: |
+          umask 077
+          python3 - <<'EOF' > secrets.json
+          import json, os
+          names = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN", "OWNER"]
+          print(json.dumps({n: os.environ[n] for n in names}))
+          EOF
+          npx --yes wrangler@4.14.0 secret bulk secrets.json --name "$WORKER"
+          rm -f secrets.json
+
+      - name: Tell the dashboard
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: python3 -m clipheaven.media_server "$URL"

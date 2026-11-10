@@ -1,0 +1,41 @@
+name: Make a notification key
+
+# Run this once (Actions → Make a notification key → Run workflow). It makes the
+# key for notifications in the ClipHeaven app and shows it on the run's page.
+# Copy it into a new secret called VAPID_PRIVATE_KEY (docs/PUSH_SETUP.md), then
+# delete the run so the key isn't left on that page.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  key:
+    name: Make the key
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Make the key
+        run: |
+          pip install -q cryptography
+          python - <<'PY'
+          import base64, os
+          from cryptography.hazmat.primitives.asymmetric import ec
+          key = ec.generate_private_key(ec.SECP256R1()).private_numbers().private_value.to_bytes(32, "big")
+          text = base64.urlsafe_b64encode(key).rstrip(b"=").decode()
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+              out.write("## Your notification key\n\n"
+                        "Press and hold to copy the line below (all of it, no spaces):\n\n"
+                        f"```\n{text}\n```\n\n"
+                        "1. Go to **Settings → Secrets and variables → Actions → New repository secret**.\n"
+                        "2. Name: `VAPID_PRIVATE_KEY`. Secret: paste the key. Tap **Add secret**.\n"
+                        "3. Come back to this run, tap **⋯ → Delete workflow run**, so the key isn't left here.\n"
+                        "4. Within an hour, open ClipHeaven from your Home Screen → Settings → Notifications → **Turn on**.\n")
+          print("Done. Open this run's Summary to copy your key.")
+          PY
